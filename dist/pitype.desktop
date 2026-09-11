@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Pitype
+GenericName=Typing Trainer
+Comment=Dead-simple typing practice with live WPM
+Exec=pitype
+TryExec=pitype
+Icon=pitype
+Terminal=false
+StartupNotify=true
+Categories=Education;Utility;
+Keywords=typing;wpm;practice;keyboard;speed;
+StartupWMClass=pitype

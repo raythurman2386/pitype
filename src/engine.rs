@@ -106,6 +106,11 @@ impl Engine {
         self.errors
     }
 
+    /// Total printable keystrokes this run has seen (for empty-run checks).
+    pub fn keystrokes(&self) -> usize {
+        self.keystrokes
+    }
+
     pub fn is_started(&self) -> bool {
         self.started.is_some()
     }

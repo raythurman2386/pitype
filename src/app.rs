@@ -26,7 +26,6 @@ actions!(
     [
         Restart,
         ToMenu,
-        Start,
         CycleMode,
         SelectValue,
         ToggleFullscreen,
@@ -39,7 +38,9 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-r", Restart, None),
         KeyBinding::new("escape", ToMenu, None),
-        KeyBinding::new("enter", Start, None),
+        // Enter is handled per-screen in `on_key_down` (#2): plain start on
+        // the menu, a double-press confirmation on results, and nothing
+        // mid-run where a stray Enter would end a timed run.
         KeyBinding::new("tab", CycleMode, None),
         KeyBinding::new("shift-tab", SelectValue, None),
         KeyBinding::new("f11", ToggleFullscreen, None),
@@ -190,9 +191,15 @@ pub struct Pitype {
     stats_store: StatsStore,
     theme_watch: FileWatch,
     last_theme_check: Instant,
+    /// First Enter press on the results screen, awaiting confirmation (#2).
+    confirm_at: Option<Instant>,
     _tick_task: Option<Task<()>>,
     _poll_task: Option<Task<()>>,
+    _confirm_task: Option<Task<()>>,
 }
+
+/// How long the first Enter press on results stays armed for the second.
+const ENTER_CONFIRM: Duration = Duration::from_secs(2);
 
 impl Pitype {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -228,8 +235,10 @@ impl Pitype {
             stats_store,
             theme_watch,
             last_theme_check: Instant::now(),
+            confirm_at: None,
             _tick_task: None,
             _poll_task: None,
+            _confirm_task: None,
         };
         this.spec = this.current_spec();
         this.spawn_poll(window, cx);
@@ -320,6 +329,7 @@ impl Pitype {
     fn show_menu(&mut self, cx: &mut Context<Self>) {
         self.screen = Screen::Menu;
         self.engine = None;
+        self.confirm_at = None;
         self.stats = self.stats_store.load();
         cx.notify();
     }
@@ -330,6 +340,12 @@ impl Pitype {
             return;
         };
         let result = engine.finish(&self.spec, now);
+        // A run nobody typed in (stray key on the menu, timer expiry) is not
+        // a session: skip persistence and go straight to the menu.
+        if engine.keystrokes() == 0 {
+            self.show_menu(cx);
+            return;
+        }
         let record = SessionRecord {
             finished_at: chrono::Utc::now().timestamp(),
             mode_tag: result.mode_tag.clone(),
@@ -347,6 +363,7 @@ impl Pitype {
         self.last_result = Some(result);
         self.new_best = new_best;
         self.screen = Screen::Results;
+        self.confirm_at = None;
         let _ = window;
         cx.notify();
     }
@@ -410,7 +427,6 @@ impl Render for Pitype {
             .bg(hex_to_hsla(&self.palette.background))
             .text_color(fg)
             .font_family("iA Writer Mono S")
-            .on_action(cx.listener(|this, _: &Start, window, cx| this.start_run(window, cx)))
             .on_action(cx.listener(|this, _: &Restart, window, cx| this.restart(window, cx)))
             .on_action(cx.listener(|this, _: &ToMenu, _, cx| this.show_menu(cx)))
             .on_action(cx.listener(|this, _: &CycleMode, _, cx| this.cycle_mode(cx)))
@@ -458,10 +474,8 @@ impl Pitype {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.screen != Screen::Typing {
-            return;
-        }
         let keystroke = &event.keystroke;
+        // Modifiers and function keys stay with the bound actions.
         if keystroke.modifiers.control
             || keystroke.modifiers.alt
             || keystroke.modifiers.platform
@@ -469,20 +483,69 @@ impl Pitype {
         {
             return;
         }
-        let Some(engine) = self.engine.as_mut() else {
-            return;
-        };
-        let key = classify_key(&keystroke.key, keystroke.key_char.as_deref());
-        if key == KeyInput::Ignored {
-            return;
+        match self.screen {
+            Screen::Menu => {
+                // Enter or any printable key starts, as the hint promises;
+                // other keys (backspace, arrows, …) do nothing.
+                if keystroke.key == "enter" {
+                    self.start_run(window, cx);
+                    return;
+                }
+                if matches!(
+                    classify_key(&keystroke.key, keystroke.key_char.as_deref()),
+                    KeyInput::Char(_)
+                ) {
+                    self.start_run(window, cx);
+                }
+            }
+            Screen::Typing => {
+                let Some(engine) = self.engine.as_mut() else {
+                    return;
+                };
+                let key = classify_key(&keystroke.key, keystroke.key_char.as_deref());
+                if key == KeyInput::Ignored {
+                    return;
+                }
+                engine.type_key(key, Instant::now());
+                engine.tick_second(Instant::now());
+                if engine.check_finished(&self.spec, Instant::now()) {
+                    self.finish_run(window, cx);
+                    return;
+                }
+                cx.notify();
+            }
+            Screen::Results => {
+                if keystroke.key != "enter" {
+                    return;
+                }
+                // Double Enter starts the next run (#2); a lone press just
+                // arms the hint and expires after a moment.
+                let now = Instant::now();
+                let armed = self
+                    .confirm_at
+                    .is_some_and(|at| now.duration_since(at) <= ENTER_CONFIRM);
+                if armed {
+                    self.confirm_at = None;
+                    self.start_run(window, cx);
+                } else {
+                    self.confirm_at = Some(now);
+                    self.spawn_confirm_reset(window, cx);
+                    cx.notify();
+                }
+            }
         }
-        engine.type_key(key, Instant::now());
-        engine.tick_second(Instant::now());
-        if engine.check_finished(&self.spec, Instant::now()) {
-            self.finish_run(window, cx);
-            return;
-        }
-        cx.notify();
+    }
+
+    /// Clear the armed Enter hint once the confirmation window passes.
+    fn spawn_confirm_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let task = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(ENTER_CONFIRM).await;
+            let _ = this.update_in(cx, |this, _, cx| {
+                this.confirm_at = None;
+                cx.notify();
+            });
+        });
+        self._confirm_task = Some(task);
     }
 
     // ---- Menu -----------------------------------------------------------
@@ -533,37 +596,14 @@ impl Pitype {
                 .iter()
                 .map(|w| format!("{w} words"))
                 .collect::<Vec<_>>(),
-            Mode::Quote => QUOTES
-                .iter()
-                .enumerate()
-                .map(|(i, q)| {
-                    format!(
-                        "{} — {}",
-                        i + 1,
-                        q.author.split(' ').take(2).collect::<Vec<_>>().join(" ")
-                    )
-                })
-                .collect(),
+            // Quote mode renders a proper list below instead of buttons (#4).
+            Mode::Quote => Vec::new(),
         };
 
-        let value_row =
-            h_flex()
-                .flex_wrap()
-                .justify_center()
-                .gap_2()
-                .children(choices.iter().enumerate().map(|(i, label)| {
-                    let selected = self.mode_index == i;
-                    Button::new(SharedString::from(format!("choice-{i}")))
-                        .label(label.clone())
-                        .when(selected, |b| b.primary())
-                        .when(!selected, |b| b.ghost())
-                        .small()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.mode_index = i;
-                            this.spec = this.current_spec();
-                            cx.notify();
-                        }))
-                }));
+        let choice_area = match self.mode {
+            Mode::Quote => self.render_quote_list(muted, accent, surface, cx),
+            _ => self.render_value_row(&choices, cx),
+        };
 
         v_flex()
             .id("menu")
@@ -590,7 +630,7 @@ impl Pitype {
                     ),
             )
             .child(div().w(px(420. * scale)).child(mode_tabs))
-            .child(value_row)
+            .child(choice_area)
             .child(
                 div()
                     .text_size(px(scale * 13.))
@@ -618,6 +658,135 @@ impl Pitype {
 }
 
 impl Pitype {
+    fn render_value_row(&self, choices: &[String], cx: &mut Context<Self>) -> AnyElement {
+        let scale = self.text_scale;
+        let accent = hex_to_hsla(&self.palette.accent);
+        let surface = hex_to_hsla(&self.palette.surface);
+        h_flex()
+            .flex_wrap()
+            .justify_center()
+            .gap_2()
+            .children(choices.iter().enumerate().map(|(i, label)| {
+                let selected = self.mode_index == i;
+                self.menu_card(
+                    SharedString::from(format!("choice-{i}")),
+                    selected,
+                    accent,
+                    surface,
+                )
+                .flex()
+                .items_center()
+                .justify_center()
+                .min_w(px(scale * 96.))
+                .text_color(if selected {
+                    accent
+                } else {
+                    fg_color(&self.palette)
+                })
+                .child(label.clone())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.mode_index = i;
+                    this.spec = this.current_spec();
+                    cx.notify();
+                }))
+            }))
+            .into_any_element()
+    }
+
+    /// The one card treatment shared by every menu picker (Time values,
+    /// Words values, quote rows) so the whole menu reads as a single style:
+    /// soft card at rest, accent wash when selected (#4).
+    fn menu_card(
+        &self,
+        id: SharedString,
+        selected: bool,
+        accent: Hsla,
+        surface: Hsla,
+    ) -> Stateful<Div> {
+        let scale = self.text_scale;
+        div()
+            .id(id)
+            .px(px(scale * 12.))
+            .py(px(scale * 7.))
+            .rounded_md()
+            .text_size(px(scale * 13.))
+            .bg(if selected {
+                accent.opacity(0.16)
+            } else {
+                surface.opacity(0.5)
+            })
+            .hover(move |s| {
+                s.bg(if selected {
+                    accent.opacity(0.24)
+                } else {
+                    surface
+                })
+            })
+    }
+
+    /// Quote picker: one comfortable row per quote with index, full author,
+    /// and a text preview — same card style as the value pickers (#4).
+    fn render_quote_list(
+        &self,
+        muted: Hsla,
+        accent: Hsla,
+        surface: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let scale = self.text_scale;
+        v_flex()
+            .id("quote-list")
+            .w(px(640. * scale))
+            .max_h(px(300. * scale))
+            .overflow_y_scroll()
+            .gap_1()
+            .children(QUOTES.iter().enumerate().map(|(i, quote)| {
+                let selected = self.mode_index % QUOTES.len() == i;
+                self.menu_card(
+                    SharedString::from(format!("quote-{i}")),
+                    selected,
+                    accent,
+                    surface,
+                )
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    div()
+                        .text_size(px(scale * 12.))
+                        .text_color(if selected { accent } else { muted })
+                        .child(format!("{}", i + 1)),
+                )
+                .child(
+                    div()
+                        .w(px(180. * scale))
+                        .truncate()
+                        .text_size(px(scale * 13.))
+                        .text_color(if selected {
+                            accent
+                        } else {
+                            fg_color(&self.palette)
+                        })
+                        .child(quote.author.to_string()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .truncate()
+                        .text_size(px(scale * 12.))
+                        .text_color(muted)
+                        .child(quote.text.to_string()),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.mode_index = i;
+                    this.spec = this.current_spec();
+                    cx.notify();
+                }))
+            }))
+            .into_any_element()
+    }
+
     // ---- Typing ---------------------------------------------------------
 
     fn render_typing(&self, muted: Hsla, accent: Hsla, _cx: &mut Context<Self>) -> AnyElement {
@@ -684,18 +853,23 @@ impl Pitype {
                 scale,
             ))
             .child(stat_block(
-                if matches!(self.spec, PromptSpec::Time(_)) {
-                    "time"
-                } else {
-                    "words"
+                match &self.spec {
+                    PromptSpec::Time(_) => "time",
+                    PromptSpec::Words(_) => "words",
+                    PromptSpec::Quote(_) => "chars",
                 },
-                if matches!(self.spec, PromptSpec::Time(_)) {
-                    format!(
+                match &self.spec {
+                    PromptSpec::Time(_) => format!(
                         "{:.0}s",
                         (d_secs(&self.spec) - elapsed.as_secs_f32()).max(0.0)
-                    )
-                } else {
-                    format!("{}/{}", engine.words_done(), words_target(&self.spec))
+                    ),
+                    PromptSpec::Words(n) => {
+                        format!("{}/{}", engine.words_done(), n)
+                    }
+                    // Quote runs progress by characters, not words.
+                    PromptSpec::Quote(_) => {
+                        format!("{}/{}", engine.cursor(), engine.prompt().chars().count())
+                    }
                 },
                 muted,
                 scale,
@@ -715,6 +889,18 @@ impl Pitype {
             .pt(px(scale * 48.))
             .gap_6()
             .child(typed_row)
+            .when(matches!(self.spec, PromptSpec::Quote(_)), |row| {
+                let index = match self.spec {
+                    PromptSpec::Quote(i) => i % QUOTES.len(),
+                    _ => 0,
+                };
+                row.child(
+                    div()
+                        .text_size(px(scale * 13.))
+                        .text_color(muted)
+                        .child(format!("— {}", QUOTES[index].author)),
+                )
+            })
             .child(div().h(px(1.0)))
             .child(stats_row)
             .child(
@@ -844,8 +1030,16 @@ impl Pitype {
             .child(
                 div()
                     .text_size(px(scale * 11.))
-                    .text_color(muted)
-                    .child("enter retry · escape menu"),
+                    .text_color(if self.confirm_at.is_some() {
+                        accent
+                    } else {
+                        muted
+                    })
+                    .child(if self.confirm_at.is_some() {
+                        "press enter again to go again"
+                    } else {
+                        "enter twice to go again · escape menu"
+                    }),
             )
             .with_animation(
                 "results-fade",
@@ -882,7 +1076,7 @@ impl Pitype {
                 div()
                     .text_size(px(self.scaled(11.)))
                     .text_color(muted)
-                    .child("enter start · ctrl-q quit"),
+                    .child("any key start · ctrl-r restart · ctrl-q quit"),
             )
     }
 }
@@ -908,12 +1102,5 @@ fn d_secs(spec: &PromptSpec) -> f32 {
     match spec {
         PromptSpec::Time(d) => d.as_secs_f32(),
         _ => 0.0,
-    }
-}
-
-fn words_target(spec: &PromptSpec) -> usize {
-    match spec {
-        PromptSpec::Words(n) => *n,
-        _ => 0,
     }
 }

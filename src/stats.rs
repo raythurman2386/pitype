@@ -59,7 +59,10 @@ impl StatsStore {
     /// Returns true when this run set a new best for its mode.
     pub fn record(&self, mut stats: Stats, record: SessionRecord) -> (Stats, bool) {
         let previous_best = stats.bests.get(&record.mode_tag).copied();
-        let new_best = previous_best.is_none_or(|best| record.net_wpm > best);
+        // A run with nothing correct (all errors / no keystrokes) is not a
+        // benchmark; it lands in history but never lowers or creates a best.
+        let new_best =
+            record.net_wpm > 0.0 && previous_best.is_none_or(|best| record.net_wpm > best);
         if new_best {
             stats.bests.insert(record.mode_tag.clone(), record.net_wpm);
         }
@@ -150,6 +153,19 @@ mod tests {
         assert_eq!(reloaded.bests.get("time-30"), Some(&72.0));
         assert_eq!(reloaded.bests.get("words-50"), Some(&10.0));
         assert_eq!(reloaded.history.len(), 4);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn zero_wpm_run_never_sets_best() {
+        let (store, path) = store("zero-best");
+        let (stats, new_best) = store.record(store.load(), record(0.0, "time-30"));
+        assert!(!new_best);
+        assert!(!stats.bests.contains_key("time-30"));
+        // A later real run still counts as a first best.
+        let (stats, real) = store.record(stats, record(42.0, "time-30"));
+        assert!(real);
+        assert_eq!(stats.bests.get("time-30"), Some(&42.0));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

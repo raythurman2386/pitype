@@ -24,7 +24,8 @@ impl PromptSpec {
     pub const TIME_CHOICES: [u64; 4] = [15, 30, 60, 120];
     /// The word counts offered on the menu.
     pub const WORD_CHOICES: [usize; 4] = [10, 25, 50, 100];
-    pub const QUOTE_COUNT: usize = 12;
+    /// Number of quotes; derived so the menu tracks the bank (#5).
+    pub const QUOTE_COUNT: usize = QUOTES.len();
 }
 
 const COMMON_WORDS: &[&str] = &[
@@ -352,24 +353,21 @@ const HARD_WORDS: &[&str] = &[
     "papyrus",
 ];
 
-const PUNCTUATED: &[&str] = &[
+/// Friendly punctuation for the default modes: apostrophes, hyphens,
+/// commas, and sentence stops — the punctuation everyone actually types.
+/// Symbols like `$5`, `#tag`, `1/2` are deliberately excluded so practice
+/// stays about letters (#1).
+const GENTLE_PUNCTUATED: &[&str] = &[
     "don't",
     "it's",
     "well-known",
     "self-taught",
     "hello,",
     "world.",
-    "wait;",
-    "yes!",
-    "hmm?",
-    "(quick)",
-    "\"true\"",
-    "e-mail",
-    "co-operate",
-    "20%",
-    "$5",
-    "#tag",
-    "1/2",
+    "maybe.",
+    "yes.",
+    "hmm,",
+    "okay,",
 ];
 
 const SENTENCES: &[&str] = &[
@@ -440,6 +438,82 @@ pub const QUOTES: &[Quote] = &[
         text: "A ship in harbor is safe, but that is not what ships are built for.",
         author: "John A. Shedd",
     },
+    Quote {
+        text: "Do the hard jobs first. The easy jobs will take care of themselves.",
+        author: "Dale Carnegie",
+    },
+    Quote {
+        text: "It is not that I am so smart, it is just that I stay with problems longer.",
+        author: "Albert Einstein",
+    },
+    Quote {
+        text: "An investment in knowledge pays the best interest.",
+        author: "Benjamin Franklin",
+    },
+    Quote {
+        text: "Genius is one percent inspiration and ninety-nine percent perspiration.",
+        author: "Thomas Edison",
+    },
+    Quote {
+        text: "The journey of a thousand miles begins with a single step.",
+        author: "Lao Tzu",
+    },
+    Quote {
+        text: "I have not failed. I have just found ten thousand ways that will not work.",
+        author: "Thomas Edison",
+    },
+    Quote {
+        text: "Whether you think you can, or you think you cannot, you are right.",
+        author: "Henry Ford",
+    },
+    Quote {
+        text: "It always seems impossible until it is done.",
+        author: "Nelson Mandela",
+    },
+    Quote {
+        text: "The secret of getting ahead is getting started.",
+        author: "Mark Twain",
+    },
+    Quote {
+        text: "It is quality rather than quantity that matters.",
+        author: "Lucius Annaeus Seneca",
+    },
+    Quote {
+        text: "We are what we repeatedly do. Excellence, then, is not an act but a habit.",
+        author: "Will Durant",
+    },
+    Quote {
+        text: "Knowledge speaks, but wisdom listens.",
+        author: "Jimi Hendrix",
+    },
+    Quote {
+        text: "The only true wisdom is in knowing you know nothing.",
+        author: "Socrates",
+    },
+    Quote {
+        text: "First, solve the problem. Then, write the code.",
+        author: "John Johnson",
+    },
+    Quote {
+        text: "Any sufficiently advanced technology is indistinguishable from magic.",
+        author: "Arthur C. Clarke",
+    },
+    Quote {
+        text: "Talk low, talk slow, and do not talk too much.",
+        author: "John Wayne",
+    },
+    Quote {
+        text: "A person who never made a mistake never tried anything new.",
+        author: "Albert Einstein",
+    },
+    Quote {
+        text: "You miss one hundred percent of the shots you do not take.",
+        author: "Wayne Gretzky",
+    },
+    Quote {
+        text: "Patience, persistence and perspiration make an unbeatable combination.",
+        author: "Napoleon Hill",
+    },
 ];
 
 /// A tiny deterministic xorshift PRNG so prompt generation is reproducible
@@ -499,8 +573,9 @@ fn word_prompt(spec: &PromptSpec, seed: u64) -> String {
     let mut words: Vec<&str> = Vec::with_capacity(target_words);
     while words.len() < target_words {
         let roll = rng.below(100);
-        let word = if words.len().is_multiple_of(17) && !PUNCTUATED.is_empty() && roll < 30 {
-            PUNCTUATED[rng.below(PUNCTUATED.len())]
+        let word = if words.len().is_multiple_of(23) && !GENTLE_PUNCTUATED.is_empty() && roll < 18 {
+            // Gentle punctuation, roughly half the old density (#1).
+            GENTLE_PUNCTUATED[rng.below(GENTLE_PUNCTUATED.len())]
         } else if roll < 4 {
             // A sentence replaces a contiguous group of words so the word
             // budget stays intact.
@@ -600,6 +675,46 @@ mod tests {
     fn prompts_are_printable_ascii_or_common_punct() {
         let text = build_prompt(&PromptSpec::Time(Duration::from_secs(60)), 99);
         assert!(text.chars().all(|c| c.is_ascii_graphic() || c == ' '));
+    }
+
+    #[test]
+    fn default_prompts_avoid_symbol_punctuation() {
+        // Standalone symbol tokens ($5, #tag, 1/2, "(quick)") are gone (#1).
+        for seed in 0..20u64 {
+            let text = build_prompt(&PromptSpec::Words(100), seed);
+            assert!(
+                !text.contains(['$', '#', '/', '%', '(', ')', '"']),
+                "seed {seed} produced symbol punctuation: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn gentle_punctuation_still_appears() {
+        // Reduced density, but not zero — apostrophes/hyphens/commas show up.
+        let mut hits = 0;
+        for seed in 0..50u64 {
+            let text = build_prompt(&PromptSpec::Words(100), seed);
+            if text.contains(['\'', '-', ',']) {
+                hits += 1;
+            }
+        }
+        assert!(hits > 10, "gentle punctuation in only {hits}/50 prompts");
+    }
+
+    #[test]
+    fn quote_bank_is_expanded_and_attribution_full() {
+        assert_eq!(PromptSpec::QUOTE_COUNT, QUOTES.len());
+        assert!(QUOTES.len() >= 30, "quote bank should have grown (#5)");
+        for quote in QUOTES {
+            assert!(!quote.author.trim().is_empty());
+            // Full names, not initials-only attributions like "S. J.".
+            assert!(quote.author.chars().any(|c| c.is_alphabetic()));
+        }
+        assert_eq!(
+            build_prompt(&PromptSpec::Quote(QUOTES.len() - 1), 1),
+            QUOTES[QUOTES.len() - 1].text
+        );
     }
 
     #[test]

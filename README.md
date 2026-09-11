@@ -9,7 +9,9 @@ interface that follows system dark/light mode and picks up Omarchy theme colors 
 
 - **Time** — 15s / 30s / 60s / 120s sprints against the clock.
 - **Words** — 10 / 25 / 50 / 100 word runs, ends on the last keystroke.
-- **Quote** — type a short quote end to end.
+- **Quote** — type a short quote end to end. A bank of 32 quotes with full
+  author attributions, shown under the text while you type and in the menu
+  picker.
 
 Every run ends on a results screen: net WPM, raw WPM, accuracy, consistency, errors, and a
 per-second WPM sparkline. Best scores per mode are tracked locally.
@@ -42,15 +44,20 @@ cargo run --release
 
 ## Shortcuts
 
-- `Enter` starts a run from the menu (or any key, on the menu).
+- Any printable key (or `Enter`) starts a run from the menu.
+- `Enter` twice, within a couple of seconds, starts the next run from the
+  results screen — a single press only arms the prompt, so a stray Enter
+  cannot launch a run by accident.
 - `Ctrl+R` restarts the current run.
 - `Escape` returns to the menu from results or mid-run.
+- `Tab` cycles Time / Words / Quote; `Shift+Tab` cycles the value (time,
+  word count, quote). Clicking works too.
 - `F11` or `Super+F` toggles fullscreen.
 - `Ctrl+Q` quits.
 
 While typing, only printable keys and Backspace count. Wrong keystrokes are counted as errors
 and flash the expected character red; the cursor does not advance. Backspace steps back within
-the typed text.
+the typed text. Enter does nothing mid-run, so it cannot end a timed run early.
 
 ## Scoring
 

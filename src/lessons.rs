@@ -11,12 +11,14 @@ pub enum PromptSpec {
 }
 
 impl PromptSpec {
-    /// Stable identifier used for stats keys and the settings file.
+    /// Stable identifier used for stats keys and the settings file. Quote
+    /// tags hash the quote text so stored bests survive reordering of the
+    /// bank as it grows.
     pub fn mode_tag(&self) -> String {
         match self {
             PromptSpec::Time(d) => format!("time-{}", d.as_secs()),
             PromptSpec::Words(n) => format!("words-{n}"),
-            PromptSpec::Quote(i) => format!("quote-{i}"),
+            PromptSpec::Quote(i) => format!("quote-{:08x}", quote_key(*i)),
         }
     }
 
@@ -24,7 +26,7 @@ impl PromptSpec {
     pub const TIME_CHOICES: [u64; 4] = [15, 30, 60, 120];
     /// The word counts offered on the menu.
     pub const WORD_CHOICES: [usize; 4] = [10, 25, 50, 100];
-    /// Number of quotes; derived so the menu tracks the bank (#5).
+    /// Number of quotes; derived so the menu tracks the bank.
     pub const QUOTE_COUNT: usize = QUOTES.len();
 }
 
@@ -353,10 +355,9 @@ const HARD_WORDS: &[&str] = &[
     "papyrus",
 ];
 
-/// Friendly punctuation for the default modes: apostrophes, hyphens,
-/// commas, and sentence stops — the punctuation everyone actually types.
-/// Symbols like `$5`, `#tag`, `1/2` are deliberately excluded so practice
-/// stays about letters (#1).
+/// Punctuation pool for the default modes: apostrophes, hyphens, commas,
+/// and sentence stops only — symbol tokens are deliberately excluded so
+/// practice stays about letters.
 const GENTLE_PUNCTUATED: &[&str] = &[
     "don't",
     "it's",
@@ -428,15 +429,15 @@ pub const QUOTES: &[Quote] = &[
     },
     Quote {
         text: "Speed is useful only if you are running in the right direction.",
-        author: "John H. Johnson",
+        author: "John Harold Johnson",
     },
     Quote {
         text: "Little by little, one travels far.",
-        author: "J. R. R. Tolkien",
+        author: "John Ronald Reuel Tolkien",
     },
     Quote {
         text: "A ship in harbor is safe, but that is not what ships are built for.",
-        author: "John A. Shedd",
+        author: "John Alcott Shedd",
     },
     Quote {
         text: "Do the hard jobs first. The easy jobs will take care of themselves.",
@@ -496,7 +497,7 @@ pub const QUOTES: &[Quote] = &[
     },
     Quote {
         text: "Any sufficiently advanced technology is indistinguishable from magic.",
-        author: "Arthur C. Clarke",
+        author: "Arthur Charles Clarke",
     },
     Quote {
         text: "Talk low, talk slow, and do not talk too much.",
@@ -559,6 +560,18 @@ fn quote_prompt(index: usize) -> String {
     quote.text.to_string()
 }
 
+/// Order-stable per-quote key (FNV-1a of the text) for stats tags; unlike
+/// the bank index it survives inserting or reordering quotes.
+fn quote_key(index: usize) -> u32 {
+    let text = QUOTES[index % QUOTES.len()].text;
+    let mut hash: u32 = 0x811c9dc5;
+    for byte in text.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
+}
+
 fn word_prompt(spec: &PromptSpec, seed: u64) -> String {
     let target_words = match spec {
         PromptSpec::Time(d) => {
@@ -574,7 +587,6 @@ fn word_prompt(spec: &PromptSpec, seed: u64) -> String {
     while words.len() < target_words {
         let roll = rng.below(100);
         let word = if words.len().is_multiple_of(23) && !GENTLE_PUNCTUATED.is_empty() && roll < 18 {
-            // Gentle punctuation, roughly half the old density (#1).
             GENTLE_PUNCTUATED[rng.below(GENTLE_PUNCTUATED.len())]
         } else if roll < 4 {
             // A sentence replaces a contiguous group of words so the word
@@ -596,6 +608,7 @@ fn word_prompt(spec: &PromptSpec, seed: u64) -> String {
     // Capitalize the first word of each sentence chunk. Empty placeholder
     // slots (from multi-word sentences) are skipped, keeping the total word
     // count exactly at the target.
+    let non_empty = words.iter().filter(|w| !w.is_empty()).count();
     let mut text = String::with_capacity(target_words * 6);
     let mut capitalize = true;
     let mut emitted = 0usize;
@@ -615,7 +628,7 @@ fn word_prompt(spec: &PromptSpec, seed: u64) -> String {
         }
         capitalize = word.ends_with(['.', '!', '?']);
         emitted += 1;
-        if emitted < words.iter().filter(|w| !w.is_empty()).count() {
+        if emitted < non_empty {
             text.push(' ');
         }
     }
@@ -668,7 +681,11 @@ mod tests {
             "time-30"
         );
         assert_eq!(PromptSpec::Words(50).mode_tag(), "words-50");
-        assert_eq!(PromptSpec::Quote(2).mode_tag(), "quote-2");
+        // Quote tags hash the text, so they survive bank reordering.
+        let tag = PromptSpec::Quote(2).mode_tag();
+        assert!(tag.starts_with("quote-"));
+        assert_eq!(tag, PromptSpec::Quote(2 + QUOTES.len()).mode_tag());
+        assert_ne!(tag, PromptSpec::Quote(3).mode_tag());
     }
 
     #[test]
@@ -679,7 +696,7 @@ mod tests {
 
     #[test]
     fn default_prompts_avoid_symbol_punctuation() {
-        // Standalone symbol tokens ($5, #tag, 1/2, "(quick)") are gone (#1).
+        // The symbol-heavy tokens ($5, #tag, 1/2) must stay out.
         for seed in 0..20u64 {
             let text = build_prompt(&PromptSpec::Words(100), seed);
             assert!(
@@ -705,11 +722,19 @@ mod tests {
     #[test]
     fn quote_bank_is_expanded_and_attribution_full() {
         assert_eq!(PromptSpec::QUOTE_COUNT, QUOTES.len());
-        assert!(QUOTES.len() >= 30, "quote bank should have grown (#5)");
+        assert!(QUOTES.len() >= 30, "quote bank should have grown");
         for quote in QUOTES {
             assert!(!quote.author.trim().is_empty());
-            // Full names, not initials-only attributions like "S. J.".
-            assert!(quote.author.chars().any(|c| c.is_alphabetic()));
+            // Attributions must be real names, not initials like "J. R.".
+            // Single-word names (Aristotle) are fine.
+            for token in quote.author.split_whitespace() {
+                let letters = token.chars().filter(|c| c.is_alphabetic()).count();
+                assert!(
+                    letters > 1 || !token.ends_with('.'),
+                    "author {:?} has an initials-only token",
+                    quote.author
+                );
+            }
         }
         assert_eq!(
             build_prompt(&PromptSpec::Quote(QUOTES.len() - 1), 1),

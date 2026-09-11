@@ -163,17 +163,6 @@ pub fn colors_candidates() -> Vec<PathBuf> {
     paths
 }
 
-pub fn omarchy_watch_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for candidate in colors_candidates() {
-        if let Some(current) = candidate.ancestors().nth(2) {
-            paths.push(current.to_path_buf());
-        }
-        paths.push(candidate);
-    }
-    paths
-}
-
 pub fn sanitized_text_scale(value: f32) -> f32 {
     if value <= 0.0 {
         1.0

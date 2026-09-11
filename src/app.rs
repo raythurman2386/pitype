@@ -2,7 +2,6 @@
 
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -13,13 +12,11 @@ use gpui_kit::component::v_flex;
 use gpui_kit::component::{Root, Sizable as _, Theme, ThemeMode};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-
 use pitype::engine::{classify_key, Engine, KeyInput, Mode, SessionResult};
 use pitype::lessons::{PromptSpec, QUOTES};
 use pitype::metrics::accuracy;
 use pitype::stats::{SessionRecord, Stats, StatsStore};
-use pitype::theme::{detect_system_dark, detect_text_scale, omarchy_watch_paths, OmarchyPalette};
+use pitype::theme::{detect_system_dark, detect_text_scale, OmarchyPalette};
 
 actions!(
     pitype_actions,
@@ -38,9 +35,8 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-r", Restart, None),
         KeyBinding::new("escape", ToMenu, None),
-        // Enter is handled per-screen in `on_key_down` (#2): plain start on
-        // the menu, a double-press confirmation on results, and nothing
-        // mid-run where a stray Enter would end a timed run.
+        // Enter is handled per-screen in `on_key_down`: plain start on the
+        // menu, double-press confirmation on results, nothing mid-run.
         KeyBinding::new("tab", CycleMode, None),
         KeyBinding::new("shift-tab", SelectValue, None),
         KeyBinding::new("f11", ToggleFullscreen, None),
@@ -100,80 +96,6 @@ enum Screen {
     Results,
 }
 
-/// File-watch wrapper for live theme re-sync (suite pattern).
-struct FileWatch {
-    events: Arc<Mutex<Vec<PathBuf>>>,
-    watcher: Option<RecommendedWatcher>,
-    watched: Vec<PathBuf>,
-}
-
-impl FileWatch {
-    fn new() -> Self {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let tx = events.clone();
-        let watcher = RecommendedWatcher::new(
-            move |res: notify::Result<notify::Event>| {
-                if let Ok(event) = res {
-                    if matches!(
-                        event.kind,
-                        EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Create(_)
-                    ) {
-                        if let Ok(mut queue) = tx.lock() {
-                            queue.extend(event.paths);
-                        }
-                    }
-                }
-            },
-            notify::Config::default(),
-        )
-        .ok();
-        Self {
-            events,
-            watcher,
-            watched: Vec::new(),
-        }
-    }
-
-    fn watch_all(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
-        self.unwatch_all();
-        for path in paths {
-            self.watch_path(&path);
-        }
-    }
-
-    fn watch_path(&mut self, path: &PathBuf) {
-        if !path.exists() || self.watched.iter().any(|p| p == path) {
-            return;
-        }
-        if let Some(watcher) = self.watcher.as_mut() {
-            if watcher.watch(path, RecursiveMode::NonRecursive).is_ok() {
-                self.watched.push(path.clone());
-            }
-        }
-    }
-
-    fn unwatch_all(&mut self) {
-        if let Some(watcher) = self.watcher.as_mut() {
-            for path in self.watched.drain(..) {
-                let _ = watcher.unwatch(&path);
-            }
-        } else {
-            self.watched.clear();
-        }
-    }
-
-    fn drain(&self) -> Vec<PathBuf> {
-        self.events
-            .lock()
-            .map(|mut q| q.drain(..).collect())
-            .unwrap_or_default()
-    }
-
-    fn needs_rearm(&self) -> bool {
-        self.watched.iter().any(|path| !path.exists())
-    }
-}
-
 pub struct Pitype {
     focus_handle: FocusHandle,
     screen: Screen,
@@ -189,11 +111,8 @@ pub struct Pitype {
     text_scale: f32,
     stats: Stats,
     stats_store: StatsStore,
-    theme_watch: FileWatch,
-    last_theme_check: Instant,
-    /// First Enter press on the results screen, awaiting confirmation (#2).
+    /// First Enter press on the results screen, awaiting confirmation.
     confirm_at: Option<Instant>,
-    _tick_task: Option<Task<()>>,
     _poll_task: Option<Task<()>>,
     _confirm_task: Option<Task<()>>,
 }
@@ -216,9 +135,6 @@ impl Pitype {
             window.focus(&initial_focus, cx);
         });
 
-        let mut theme_watch = FileWatch::new();
-        theme_watch.watch_all(omarchy_watch_paths());
-
         let mut this = Self {
             focus_handle,
             screen: Screen::Menu,
@@ -233,10 +149,7 @@ impl Pitype {
             text_scale,
             stats,
             stats_store,
-            theme_watch,
-            last_theme_check: Instant::now(),
             confirm_at: None,
-            _tick_task: None,
             _poll_task: None,
             _confirm_task: None,
         };
@@ -265,11 +178,6 @@ impl Pitype {
 
     /// Every 400 ms: re-read the Omarchy palette, re-apply when it changed.
     fn poll_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let _events = self.theme_watch.drain();
-        if self.theme_watch.needs_rearm() {
-            let paths = omarchy_watch_paths();
-            self.theme_watch.watch_all(paths);
-        }
         let dark = detect_system_dark();
         let fresh = OmarchyPalette::load(dark);
         if fresh != self.palette {
@@ -277,7 +185,6 @@ impl Pitype {
             self.apply_palette(window, cx);
             cx.notify();
         }
-        self.last_theme_check = Instant::now();
         if self.screen == Screen::Typing {
             self.tick_typing(window, cx);
         }
@@ -340,8 +247,9 @@ impl Pitype {
             return;
         };
         let result = engine.finish(&self.spec, now);
-        // A run nobody typed in (stray key on the menu, timer expiry) is not
-        // a session: skip persistence and go straight to the menu.
+        // No finish path today can produce a zero-keystroke run (the clock
+        // starts on the first printable key); guard anyway so a future
+        // finish path can't persist an empty session.
         if engine.keystrokes() == 0 {
             self.show_menu(cx);
             return;
@@ -456,6 +364,9 @@ impl Pitype {
     }
 
     fn cycle_mode(&mut self, cx: &mut Context<Self>) {
+        if self.screen != Screen::Menu {
+            return;
+        }
         self.mode = self.mode.next();
         self.mode_index = 0;
         self.spec = self.current_spec();
@@ -463,6 +374,9 @@ impl Pitype {
     }
 
     fn next_value(&mut self, cx: &mut Context<Self>) {
+        if self.screen != Screen::Menu {
+            return;
+        }
         let choices = match self.mode {
             Mode::Timed => PromptSpec::TIME_CHOICES.len(),
             Mode::Words => PromptSpec::WORD_CHOICES.len(),
@@ -518,8 +432,8 @@ impl Pitype {
                 if keystroke.key != "enter" {
                     return;
                 }
-                // Double Enter starts the next run (#2); a lone press just
-                // arms the hint and expires after a moment.
+                // Double Enter starts the next run; a lone press just arms
+                // the hint and expires after a moment.
                 let now = Instant::now();
                 let armed = self
                     .confirm_at
@@ -596,7 +510,7 @@ impl Pitype {
                 .iter()
                 .map(|w| format!("{w} words"))
                 .collect::<Vec<_>>(),
-            // Quote mode renders a proper list below instead of buttons (#4).
+            // Quote mode renders its list below instead of buttons.
             Mode::Quote => Vec::new(),
         };
 
@@ -645,7 +559,7 @@ impl Pitype {
                     .py(px(scale * 8.))
                     .bg(surface)
                     .text_size(px(scale * 15.))
-                    .child("press any key to start")
+                    .child("start typing to begin")
                     .with_animation(
                         "start-hint-fade",
                         Animation::new(Duration::from_millis(900)).with_easing(ease_in_out),
@@ -694,8 +608,7 @@ impl Pitype {
     }
 
     /// The one card treatment shared by every menu picker (Time values,
-    /// Words values, quote rows) so the whole menu reads as a single style:
-    /// soft card at rest, accent wash when selected (#4).
+    /// Words values, quote rows).
     fn menu_card(
         &self,
         id: SharedString,
@@ -724,8 +637,8 @@ impl Pitype {
             })
     }
 
-    /// Quote picker: one comfortable row per quote with index, full author,
-    /// and a text preview — same card style as the value pickers (#4).
+    /// Quote picker: one row per quote with index, full author, and a
+    /// text preview — same card style as the value pickers.
     fn render_quote_list(
         &self,
         muted: Hsla,
@@ -798,35 +711,44 @@ impl Pitype {
         let prompt = engine.prompt();
         let cursor = engine.cursor();
         let flash = engine.flash(now);
+        let error_color = hex_to_hsla("#ff6b6b");
 
+        // One element per word (plus spaces), not one per character, so a
+        // keystroke rebuilds a handful of word nodes instead of ~1.5k char
+        // nodes on long prompts.
         let mut typed_row = h_flex().flex_wrap().max_w(px(760. * scale));
-        for (i, ch) in prompt.chars().enumerate() {
+        let mut word = h_flex();
+        let mut char_index = 0usize;
+        for ch in prompt.chars() {
+            if ch == ' ' {
+                typed_row = typed_row
+                    .child(word)
+                    .child(space_cell(muted, char_index, scale));
+                word = h_flex();
+                char_index += 1;
+                continue;
+            }
+            let i = char_index;
             let is_past = i < cursor;
             let is_current = i == cursor;
             let is_error = flash == Some(i);
             let color = if is_error {
-                hex_to_hsla("#ff6b6b")
+                error_color
             } else if is_past {
                 fg_color(&self.palette)
             } else {
                 muted
             };
             let base = div()
-                .id(SharedString::from(format!("ch-{i}")))
-                .min_w(px(0.62 * 12. * scale))
                 .text_size(px(scale * 22.))
                 .line_height(relative(1.5))
                 .text_color(color)
                 .when(is_current, |c| c.bg(accent.opacity(0.22)).rounded_sm())
-                .when(is_error, |c| c.bg(hex_to_hsla("#ff6b6b").opacity(0.18)))
-                .child(if ch == ' ' {
-                    "\u{00b7}".to_string()
-                } else {
-                    ch.to_string()
-                });
+                .when(is_error, |c| c.bg(error_color.opacity(0.18)))
+                .child(ch.to_string());
             let cell = if is_current {
                 base.with_animation(
-                    SharedString::from(format!("caret-{i}")),
+                    "caret",
                     Animation::new(Duration::from_millis(900))
                         .repeat()
                         .with_easing(pulsating_between(0.35, 1.0)),
@@ -836,8 +758,10 @@ impl Pitype {
             } else {
                 base.into_any_element()
             };
-            typed_row = typed_row.child(cell);
+            word = word.child(cell);
+            char_index += 1;
         }
+        typed_row = typed_row.child(word);
 
         let elapsed = engine.elapsed(now);
         let wpm = engine.rolling_wpm();
@@ -1076,9 +1000,20 @@ impl Pitype {
                 div()
                     .text_size(px(self.scaled(11.)))
                     .text_color(muted)
-                    .child("any key start · ctrl-r restart · ctrl-q quit"),
+                    .child("start typing · ctrl-r restart · ctrl-q quit"),
             )
     }
+}
+
+/// A space between words in the typing view: a fixed-width cell showing a
+/// faint middle dot so word boundaries stay visible while typing.
+fn space_cell(muted: Hsla, index: usize, scale: f32) -> Div {
+    div()
+        .text_size(px(scale * 22.))
+        .line_height(relative(1.5))
+        .text_color(muted.opacity(0.6))
+        .when(index > 0, |c| c.ml(px(0.62 * 12. * scale)))
+        .child("\u{00b7}")
 }
 
 fn stat_block(label: &'static str, value: String, color: Hsla, scale: f32) -> Div {

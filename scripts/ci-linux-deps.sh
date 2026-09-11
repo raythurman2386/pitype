@@ -3,7 +3,7 @@
 set -euo pipefail
 
 sudo apt-get update
-sudo apt-get install -y \
+sudo apt-get install -y --no-install-recommends \
   gcc \
   g++ \
   clang \

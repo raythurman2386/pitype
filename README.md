@@ -36,6 +36,15 @@ Uninstall with `./scripts/uninstall.sh` (session history is kept).
 Tagged releases (`v*`) build a Linux x86_64 tarball on GitHub Actions. Unpack it and run
 `./install.sh` inside.
 
+## Release signing
+
+Every release's `checksums.txt` is signed with an Ed25519 key, so an installer can prove the checksums (and therefore the tarball) came from this repo:
+
+- `bash scripts/gen-signing-key.sh` generates the keypair into `~/.pitype/signing` — the secret key stays offline forever and is never committed, used in CI, or uploaded. Only the public key is committed (`pitype-signing-key.pub`) and pinned in the installers.
+- `bash scripts/sign-release.sh CHECKSUMS_FILE SECRET_KEY` signs one file; `scripts/sign-releases.sh VERSION...` batch-signs published releases offline into `~/.pitype/signing/releases/<version>/`; `scripts/upload-release-sigs.sh VERSION...` attaches each `checksums.txt.sig` back to its release with `gh release upload --clobber`.
+
+Verification on the installer side is fail-closed: a release without a signature, or whose signature does not verify against the pinned public key, is refused.
+
 ## Run from source
 
 ```sh

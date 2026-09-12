@@ -33,8 +33,7 @@ pitype
 
 Uninstall with `./scripts/uninstall.sh` (session history is kept).
 
-Tagged releases (`v*`) build a Linux x86_64 tarball on GitHub Actions. Unpack it and run
-`./install.sh` inside.
+Tagged releases (`v*`) build Linux tarballs on GitHub Actions for x86_64 and aarch64 (Raspberry Pi 5 and other 64-bit ARM boards), each requiring glibc 2.39+ (Debian 13, Ubuntu 24.04, current Raspberry Pi OS). Unpack the one for your machine and run `./install.sh` inside.
 
 ## Run from source
 

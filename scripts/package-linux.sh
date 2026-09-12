@@ -1,26 +1,33 @@
 #!/usr/bin/env bash
 # Package Pitype into a self-contained Linux tarball for releases.
 # Usage: scripts/package-linux.sh [target-triple]
+# Env overrides: TARGET (target triple), PREBUILT_BIN (skip the cargo build),
+# OUT_DIR (output directory, default: <cargo target dir>/package).
 set -euo pipefail
 
+cd "$(dirname "$0")/.."
 VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
 ARCH="${ARCH:-x86_64}"
-TARGET="${1:-${ARCH}-unknown-linux-gnu}"
-NAME="pitype"
+TARGET="${TARGET:-${1:-${ARCH}-unknown-linux-gnu}}"
 # target-dir may be overridden (e.g. shared cache in ~/.cargo/config.toml),
 # so ask cargo where the build landed instead of assuming target/.
 TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
 TARGET_DIR="${TARGET_DIR:-target}"
-OUT_DIR="${TARGET_DIR}/package"
+OUT_DIR="${OUT_DIR:-${TARGET_DIR}/package}"
+NAME="pitype"
+BIN="${PREBUILT_BIN:-${TARGET_DIR}/${TARGET}/release/${NAME}}"
 STAGE="${OUT_DIR}/${NAME}-${VERSION}-${TARGET}"
 
-cd "$(dirname "$0")/.."
+if [[ ! -x "$BIN" ]]; then
+  cargo build --release --locked --target "$TARGET"
+  BIN="${TARGET_DIR}/${TARGET}/release/${NAME}"
+fi
+[[ -x "$BIN" ]] || { echo "package-linux: missing binary at $BIN (build --release first)" >&2; exit 1; }
+
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 
-cargo build --release --locked --target "$TARGET"
-
-install -Dm755 "${TARGET_DIR}/${TARGET}/release/${NAME}" "$STAGE/${NAME}"
+install -Dm755 "$BIN" "$STAGE/${NAME}"
 install -Dm644 "dist/${NAME}.desktop" "$STAGE/${NAME}.desktop"
 install -Dm644 "dist/${NAME}.svg" "$STAGE/${NAME}.svg"
 install -Dm644 "LICENSE" "$STAGE/LICENSE"

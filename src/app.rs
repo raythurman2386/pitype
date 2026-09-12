@@ -26,6 +26,7 @@ actions!(
         CycleMode,
         SelectValue,
         ToggleFullscreen,
+        ToggleKeyboard,
         Quit
     ]
 );
@@ -41,6 +42,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-tab", SelectValue, None),
         KeyBinding::new("f11", ToggleFullscreen, None),
         KeyBinding::new("super-f", ToggleFullscreen, None),
+        KeyBinding::new("ctrl-k", ToggleKeyboard, None),
         KeyBinding::new("ctrl-q", Quit, None),
     ]);
 }
@@ -113,12 +115,26 @@ pub struct Pitype {
     stats_store: StatsStore,
     /// First Enter press on the results screen, awaiting confirmation.
     confirm_at: Option<Instant>,
+    /// On-screen keyboard shown under the prompt while typing.
+    keyboard_visible: bool,
+    /// Last key press (label + shift) with its timestamp, for the press
+    /// flash. Cleared after a short TTL like the error flash.
+    pressed: Option<(pitype::keyboard::KeyHit, Instant)>,
+    /// Window width as of the last render, for keyboard sizing.
+    viewport_width: f32,
     _poll_task: Option<Task<()>>,
     _confirm_task: Option<Task<()>>,
+    _press_task: Option<Task<()>>,
 }
 
 /// How long the first Enter press on results stays armed for the second.
 const ENTER_CONFIRM: Duration = Duration::from_secs(2);
+
+/// How long a pressed key stays lit on the on-screen keyboard.
+const PRESS_TTL: Duration = Duration::from_millis(180);
+
+/// Horizontal breathing room on each side of the keyboard board.
+const KEYBOARD_MARGIN: f32 = 24.0;
 
 impl Pitype {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -150,8 +166,12 @@ impl Pitype {
             stats,
             stats_store,
             confirm_at: None,
+            keyboard_visible: true,
+            pressed: None,
+            viewport_width: 920.0,
             _poll_task: None,
             _confirm_task: None,
+            _press_task: None,
         };
         this.spec = this.current_spec();
         this.spawn_poll(window, cx);
@@ -321,6 +341,7 @@ fn parse(value: &str) -> Option<Hsla> {
 
 impl Render for Pitype {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.viewport_width = window.viewport_size().width.as_f32();
         self.apply_palette(window, cx);
         let fg = hex_to_hsla(&self.palette.foreground);
         let muted = hex_to_hsla(&self.palette.muted);
@@ -344,6 +365,10 @@ impl Render for Pitype {
                     window.toggle_fullscreen();
                 }),
             )
+            .on_action(cx.listener(|this, _: &ToggleKeyboard, _, cx| {
+                this.keyboard_visible = !this.keyboard_visible;
+                cx.notify();
+            }))
             .on_action(cx.listener(|_: &mut Self, _: &Quit, _, cx| cx.quit()))
             .on_key_down(cx.listener(Self::on_key_down))
             .when(self.screen == Screen::Menu, |this| {
@@ -420,9 +445,11 @@ impl Pitype {
                 if key == KeyInput::Ignored {
                     return;
                 }
-                engine.type_key(key, Instant::now());
+                engine.type_key(key.clone(), Instant::now());
                 engine.tick_second(Instant::now());
-                if engine.check_finished(&self.spec, Instant::now()) {
+                let finished = engine.check_finished(&self.spec, Instant::now());
+                self.record_press(key, window, cx);
+                if finished {
                     self.finish_run(window, cx);
                     return;
                 }
@@ -460,6 +487,34 @@ impl Pitype {
             });
         });
         self._confirm_task = Some(task);
+    }
+
+    /// Light up the key that was just pressed on the on-screen keyboard.
+    /// Backspace highlights its key too; modifiers never reach here.
+    fn record_press(&mut self, key: KeyInput, window: &mut Window, cx: &mut Context<Self>) {
+        let hit = match key {
+            KeyInput::Backspace => pitype::keyboard::key_for_label("backspace"),
+            KeyInput::Char(c) => pitype::keyboard::key_for_char(c),
+            KeyInput::Ignored => None,
+        };
+        let Some(hit) = hit else {
+            return;
+        };
+        self.pressed = Some((hit, Instant::now()));
+        let task = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(PRESS_TTL).await;
+            let _ = this.update_in(cx, |this, _, cx| {
+                // Only clear if no newer press replaced it.
+                let fresh = this
+                    .pressed
+                    .is_some_and(|(_, at)| at.elapsed() <= PRESS_TTL);
+                if !fresh {
+                    this.pressed = None;
+                    cx.notify();
+                }
+            });
+        });
+        self._press_task = Some(task);
     }
 
     // ---- Menu -----------------------------------------------------------
@@ -831,8 +886,11 @@ impl Pitype {
                 div()
                     .text_size(px(scale * 11.))
                     .text_color(muted)
-                    .child("ctrl-r restart · escape menu"),
+                    .child("ctrl-r restart · ctrl-k keyboard · escape menu"),
             )
+            .when(self.keyboard_visible, |col| {
+                col.child(self.render_keyboard(accent))
+            })
             .into_any_element()
     }
 
@@ -974,6 +1032,107 @@ impl Pitype {
     }
 
     // ---- Shared ---------------------------------------------------------
+
+    /// The on-screen keyboard: idle caps in surface, the next key tinted
+    /// with a soft accent (plus its shift keys), the just-pressed key
+    /// briefly lit. Rows are half a unit apart so the layout reads like a
+    /// physical board. Sized with text_scale and clamped to the window;
+    /// hides entirely when it cannot fit readably.
+    fn render_keyboard(&self, accent: Hsla) -> AnyElement {
+        let surface = hex_to_hsla(&self.palette.surface);
+        let error_color = hex_to_hsla("#ff6b6b");
+        let muted = hex_to_hsla(&self.palette.muted);
+        let bg = hex_to_hsla(&self.palette.background);
+        let fg = fg_color(&self.palette);
+
+        // Board width = widest row plus stagger, sized by text_scale like
+        // the rest of the UI, then shrunk if the window is too narrow and
+        // hidden if it would fall below a readable key size.
+        let Some(unit) = self.board_unit_width() else {
+            return div().into_any_element();
+        };
+        let key_h = unit * 1.1;
+        let now = Instant::now();
+
+        // Next expected character from the prompt, if any.
+        let next = self.engine.as_ref().and_then(|e| {
+            e.prompt()
+                .chars()
+                .nth(e.cursor())
+                .and_then(pitype::keyboard::key_for_char)
+        });
+        let pressed = self
+            .pressed
+            .filter(|(_, at)| now.duration_since(*at) <= PRESS_TTL)
+            .map(|(hit, _)| hit);
+        let error_live = self.engine.as_ref().is_some_and(|e| e.flash(now).is_some());
+
+        let mut board = v_flex().gap(px(unit * 0.3));
+        for (row_index, keys) in pitype::keyboard::ROWS.iter().enumerate() {
+            // Stagger each row half a key so the board tapers like the
+            // physical stagger it models.
+            let mut row = h_flex()
+                .gap(px(unit * 0.25))
+                .ml(px(unit * 0.5 * row_index as f32));
+            for (index, key) in keys.iter().enumerate() {
+                let is_next = next
+                    .map(|n| n.row == row_index && n.index == index)
+                    .unwrap_or(false);
+                let is_shift_next = next
+                    .map(|n| n.shift && key.label == "shift")
+                    .unwrap_or(false);
+                let is_pressed = pressed
+                    .map(|p| p.row == row_index && p.index == index)
+                    .unwrap_or(false);
+                let error_flash = is_next && error_live;
+                // Idle caps stay quiet; only the next key, its shifts, and
+                // a fresh press get color.
+                let (cap_bg, cap_fg) = if is_pressed {
+                    (accent.opacity(0.8), bg)
+                } else if error_flash {
+                    (error_color.opacity(0.5), bg)
+                } else if is_next {
+                    (accent.opacity(0.28), fg)
+                } else if is_shift_next {
+                    (surface, accent)
+                } else if key.modifier {
+                    (surface.opacity(0.55), muted.opacity(0.75))
+                } else {
+                    (surface.opacity(0.55), muted)
+                };
+                let base = div()
+                    .w(px(key.width * unit))
+                    .h(px(key_h))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .text_size(px(unit * 0.34))
+                    .bg(cap_bg)
+                    .text_color(cap_fg);
+                let cap = match key.icon {
+                    Some(path) => {
+                        base.child(svg().path(path).size(px(unit * 0.48)).text_color(cap_fg))
+                    }
+                    None => base.when(key.label != "space", |c| c.child(key.label)),
+                };
+                row = row.child(cap);
+            }
+            board = board.child(row);
+        }
+        board.mt(px(4.0)).into_any_element()
+    }
+
+    /// Per-key unit size in px that fits the board in the current window,
+    /// or `None` when the window is too small for a readable board
+    /// (tiled layouts).
+    fn board_unit_width(&self) -> Option<f32> {
+        let board_units = pitype::keyboard::ROW_WIDTH + 0.5; // widest row + stagger
+        let gaps = (pitype::keyboard::ROWS[0].len() - 1) as f32 * 0.25;
+        let usable = self.viewport_width - 2.0 * KEYBOARD_MARGIN;
+        let unit = (usable / (board_units + gaps)).min(30.0 * self.text_scale);
+        (unit >= 18.0).then_some(unit)
+    }
 
     fn render_status_bar(&self, muted: Hsla, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()

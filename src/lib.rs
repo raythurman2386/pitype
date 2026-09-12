@@ -2,6 +2,7 @@
 
 pub mod engine;
 pub mod icons;
+pub mod keyboard;
 pub mod lessons;
 pub mod metrics;
 pub mod stats;

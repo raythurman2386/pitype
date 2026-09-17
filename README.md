@@ -1,79 +1,70 @@
 # Pitype
 
-A dead-simple typing practice app built with [GPUI Kit](https://github.com/longbridge/gpui-kit).
+Typing practice for the [pi suite](https://github.com/raythurman2386), built
+with [GPUI Kit](https://github.com/longbridge/gpui-kit) — a small, native,
+theme-following desktop app written for Raspberry Pi 5-class hardware (and
+happy on any Linux desktop). Open it, pick a mode, type.
 
-Open it, pick a mode, type. Live words-per-minute, live accuracy, and a calm, minimal
-interface that follows system dark/light mode and picks up Omarchy theme colors when present.
+## Features
 
-## Modes
+- **Three modes** — Time (15s / 30s / 60s / 120s sprints against the clock),
+  Words (10 / 25 / 50 / 100 word runs that end on the last keystroke), and
+  Quote (type a short quote end to end; a bank of 31 quotes with author
+  attributions shown under the text and in the menu picker).
+- **Results screen** for every run: net WPM, raw WPM, accuracy, consistency,
+  errors, and a per-second WPM sparkline. Bests per mode and the last 50
+  sessions are tracked locally.
+- **Live feedback**: rolling WPM and accuracy while you type; wrong
+  keystrokes count as errors and flash the expected character red while the
+  cursor stays put; Backspace steps back within the typed text.
+- **Aesthetic**: keyboard-first, follows the desktop dark/light mode and
+  text scale, and live re-tints from the Omarchy theme palette.
 
-- **Time** — 15s / 30s / 60s / 120s sprints against the clock.
-- **Words** — 10 / 25 / 50 / 100 word runs, ends on the last keystroke.
-- **Quote** — type a short quote end to end. A bank of 32 quotes with full
-  author attributions, shown under the text while you type and in the menu
-  picker.
-
-Every run ends on a results screen: net WPM, raw WPM, accuracy, consistency, errors, and a
-per-second WPM sparkline. Best scores per mode are tracked locally.
+The scoring math and prompt generation are pure Rust with no UI imports, so
+WPM, accuracy, consistency, and prompt generation are covered by unit tests
+(48 across the suite).
 
 ## Install
 
-User-local install (binary, icon, launcher). No root:
-
-```sh
-./scripts/install.sh
-```
-
-That puts `pitype` on `~/.local/bin`, a desktop entry in the app launcher, and the icon in
-hicolor. Then:
-
-```sh
-pitype
-```
-
-Or install straight from a tagged release without cloning:
+User-local install from a tagged release (no root, Ed25519-verified,
+fail-closed):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/raythurman2386/pitype/main/scripts/netinstall.sh | bash
 ```
 
-The netinstaller resolves the latest `v*` release, verifies its `checksums.txt` against a pinned Ed25519 public key (fail closed — no signature or a bad one refuses the install), checks the tarball's SHA-256, then installs into `~/.local` (override with `--prefix DIR`, or a version argument: `... | bash -s -- 0.1.3`).
-
-Uninstall with `./scripts/uninstall.sh` (session history is kept).
-
-Tagged releases (`v*`) build Linux tarballs on GitHub Actions for x86_64 and aarch64 (Raspberry Pi 5 and other 64-bit ARM boards), each requiring glibc 2.39+ (Debian 13, Ubuntu 24.04, current Raspberry Pi OS). Unpack the one for your machine and run `./install.sh` inside.
-
-## Release signing
-
-Every release's `checksums.txt` is signed with an Ed25519 key, so an installer can prove the checksums (and therefore the tarball) came from this repo:
-
-- `bash scripts/gen-signing-key.sh` generates the keypair into `~/.pitype/signing` — the secret key stays offline forever and is never committed, used in CI, or uploaded. Only the public key is committed (`pitype-signing-key.pub`) and pinned in the installers.
-- `bash scripts/sign-release.sh CHECKSUMS_FILE SECRET_KEY` signs one file; `scripts/sign-releases.sh VERSION...` batch-signs published releases offline into `~/.pitype/signing/releases/<version>/`; `scripts/upload-release-sigs.sh VERSION...` attaches each `checksums.txt.sig` back to its release with `gh release upload --clobber`.
-
-Verification on the installer side is fail-closed: a release without a signature, or whose signature does not verify against the pinned public key, is refused.
-
-## Run from source
+Or build and install from source:
 
 ```sh
-cargo run --release
+cargo build --release
+./scripts/install.sh
 ```
 
-## Shortcuts
+Uninstall with `./scripts/uninstall.sh` (session history is kept). The
+netinstaller accepts a `--prefix` directory, an optional version argument,
+and `--force`; the source install honors `PREFIX=DIR`.
 
-- Any printable key (or `Enter`) starts a run from the menu.
-- `Enter` twice, within a couple of seconds, starts the next run from the
-  results screen — a single press only arms the prompt, so a stray Enter
-  cannot launch a run by accident.
-- `Ctrl+R` restarts the current run.
-- `Escape` returns to the menu from results or mid-run.
-- `Tab` cycles Time / Words / Quote; `Shift+Tab` cycles the value (time,
-  word count, quote). Clicking works too.
-- `F11` or `Super+F` toggles fullscreen.
-- `Ctrl+Q` quits.
+Tagged `v*` releases also build x86_64 + aarch64 tarballs on GitHub Actions
+(glibc 2.39+ — e.g. Raspberry Pi OS / Debian 13). Unpack the one for your
+architecture and run `./install.sh` inside.
 
-While typing, only printable keys and Backspace count. Wrong keystrokes are counted as errors
-and flash the expected character red; the cursor does not advance. Backspace steps back within
-the typed text. Enter does nothing mid-run, so it cannot end a timed run early.
+Releases are authenticated with Ed25519 signatures over `checksums.txt`; the
+public key is committed as `pitype-signing-key.pub` and pinned in the
+installer, which refuses anything it cannot verify.
+
+## Keyboard
+
+| Keys | Action |
+|---|---|
+| Any printable key / `Enter` | Start a run from the menu |
+| `Enter` twice | Next run from results (a single press only arms the prompt) |
+| `Ctrl+R` | Restart the current run |
+| `Esc` | Back to the menu from results or mid-run |
+| `Tab` / `Shift+Tab` | Cycle mode (Time/Words/Quote) · cycle its value |
+| `F11` / `Super+F` | Fullscreen · `Ctrl+Q` quit |
+
+While typing, only printable keys and Backspace count. Enter does nothing
+mid-run, so it cannot end a timed run early.
 
 ## Scoring
 
@@ -82,17 +73,37 @@ the typed text. Enter does nothing mid-run, so it cannot end a timed run early.
 - **Accuracy** is correct keystrokes over all printable keystrokes.
 - **Consistency** rewards steady per-second speed over the run.
 
-History (last 50 sessions) and bests are stored in `~/.local/share/pitype/stats.json`.
+History (last 50 sessions) and bests are stored in
+`~/.local/share/pitype/stats.json`.
 
-## Theme
+## State and theming
 
-Colors come from `~/.local/state/omarchy/current/theme/colors.toml` (or
-`~/.local/state/pimarchy/current/theme/colors.toml`) when present, and are re-read live when
-the theme changes. Dark/light also follows `gsettings` `color-scheme`; text follows the
-desktop text size (`gsettings` `text-scaling-factor`). Set `PITYPE_THEME_DIR` to load a theme
-from elsewhere.
+Colors follow the desktop theme —
+`~/.local/state/pimarchy/current/theme/colors.toml` first, then Omarchy —
+re-tinting live on theme switches; dark/light mode follows `gsettings`
+`color-scheme`; text follows the desktop text scale (`gsettings`
+`text-scaling-factor`). `PITYPE_THEME_DIR` overrides the search for tests.
 
 ## Fonts
 
-The iA Writer Mono font is bundled under the SIL Open Font License 1.1; see `fonts/OFL.txt`.
-The font is copyright Information Architects Inc. and based on IBM Plex, copyright IBM Corp.
+The iA Writer Mono font is bundled under the SIL Open Font License 1.1; see
+`fonts/OFL.txt`. The font is copyright Information Architects Inc. and based
+on IBM Plex, copyright IBM Corp.
+
+## Development
+
+```sh
+cargo fmt --check          # formatting
+cargo clippy --all-targets -- -D warnings
+cargo test                 # 48 tests
+cargo run --release        # practice
+```
+
+CI runs fmt, clippy, and tests on every push; tagged `v*` releases build
+x86_64 + aarch64 tarballs (glibc 2.39+) with an install smoke test, and the
+netinstall integrity harness can be run locally with
+`bash scripts/test-netinstall.sh`.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Bundled fonts: SIL OFL 1.1 (see above).
